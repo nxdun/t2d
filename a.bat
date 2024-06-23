@@ -3,9 +3,9 @@
 sp 'HKCU:\Volatile Environment' 'Edge_Removal' @'
 
 $also_remove_webview = 1
-## why also remove webview? because it is 2 copies of edge, not a slimmed down CEF, and is driving bloated web apps
+## why also remove webview? because it is 2 copies of edge, not a slimmed down CEF, and is driving bloated web apps.
 $also_remove_widgets = 1
-## why also remove widgets? because it is a webview glorified ad portal on msn and bing news cathering to stupid people
+## why also remove widgets? because it is a webview glorified ad portal on msn and bing news cathering to wierd people
 $also_remove_xsocial = 1
 ## why also remove xsocial? because it starts webview setup every boot - xbox gamebar will still work without the social crap
 
@@ -28,7 +28,7 @@ $global:ALLHIVES = 'HKCU:\SOFTWARE','HKLM:\SOFTWARE','HKCU:\SOFTWARE\Policies','
 if ($IS64) { $global:ALLHIVES += "HKCU:\$SOFTWARE","HKLM:\$SOFTWARE","HKCU:\$SOFTWARE\Policies","HKLM:\$SOFTWARE\Policies"}
 ## -------------------------------------------------------------------------------------------------------------------------------
 
-## 1 bonus! enter into powershell console: firefox / edge / webview to install a browser / reinstall edge / webview after removal
+## 1 bonus! enter into powershell console: firefox / edge / webview to install a browser / reinstall edge / webview after removal 1 shot
 function global:firefox { $url = 'https://download.mozilla.org/?product=firefox-stub'
   $setup = "$((new-object -ComObject Shell.Application).NameSpace('shell:Downloads').Self.Path)\Firefox Installer.exe"
   write-host $url; Invoke-WebRequest $url -OutFile $setup; start $setup
@@ -110,7 +110,7 @@ foreach ($name in $remove_win32) { foreach ($sw in $ALLHIVES) {
 }}
 PREPARE_EDGE
 
-## find all Edge setup.exe and gather BHO paths for OpenWebSearch / MSEdgeRedirect usage
+## find all Edge setup.exe and gather BHO paths for OpenWebSearch / MSEdgeRedirect usage.
 $edges = @(); $bho = @(); $edgeupdates = @(); 'LocalApplicationData','ProgramFilesX86','ProgramFiles' |foreach {
   $folder = [Environment]::GetFolderPath($_); $bho += dir "$folder\Microsoft\Edge*\ie_to_edge_stub.exe" -rec -ea 0
   if ($WEBV) {$edges += dir "$folder\Microsoft\Edge*\setup.exe" -rec -ea 0 |where {$_ -like '*EdgeWebView*'}}
@@ -147,7 +147,7 @@ foreach ($choice in $remove_appx) { if ('' -eq $choice.Trim()) {continue}
 }
 ## -------------------------------------------------------------------------------------------------------------------------------
 
-## 5 run found *Edge* setup.exe with uninstall args and wait in-between
+## 5 run found *Edge* setup with uninstall args and wait in-between
 foreach ($setup in $edges) { if (-not (test-path $setup)) {continue}
   if ($setup -like '*EdgeWebView*') {$target = "--msedgewebview"} else {$target = "--msedge"}
   $sulevel = ('--system-level','--user-level')[$setup -like '*\AppData\Local\*']
@@ -209,7 +209,7 @@ foreach ($sw in $ALLHIVES) {
 }
 ## -------------------------------------------------------------------------------------------------------------------------------
 
-## 7 add bundled OpenWebSearch script to redirect microsoft-edge: anti-competitive links to the default browser
+## 7 adds bundled OpenWebSearch script to redirect microsoft-edge: anti-competitive links to the default browser
 $MSEP = ($env:ProgramFiles,${env:ProgramFiles(x86)})[[Environment]::Is64BitOperatingSystem] + '\Microsoft\Edge\Application'
 $IFEO = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
 $MIN = ('--headless','--width 1 --height 1')[([environment]::OSVersion.Version.Build) -gt 25179]
@@ -286,7 +286,7 @@ rem done
 
 $@
 [io.file]::WriteAllText("$DIR\OpenWebSearch.cmd", $OpenWebSearch)
-## -------------------------------------------------------------------------------------------------------------------------------
+## ------------------------------------------------------------------------------------------------------------------------------
 
 ## 8 done
 $done = gp 'Registry::HKEY_Users\S-1-5-21*\Volatile*' Edge_Removal -ea 0; if ($done) {rp $done.PSPath Edge_Removal -force -ea 0}
@@ -295,7 +295,7 @@ if ((get-process -name 'explorer' -ea 0) -eq $null) {start explorer}
 ## bonus enter into powershell console: firefox / edge / webview to install a browser / reinstall edge or webview after removal
 ${.} = [char]27; $firefox = "${.}[38;2;255;165;0m firefox"; $reinstall = "${.}[96m edge / webview / xsocial${.}[97m "
 write-host "`n${.}[40;32m EDGE REMOVED! ${.}[97m -GET-ANOTHER-BROWSER? ENTER:$firefox ${.}[97m -REINSTALL? ENTER:$reinstall"
-## -------------------------------------------------------------------------------------------------------------------------------
+## ------------------------------------------------------------------------------------------------------------------------------
 
 ## 0 ask to run script as admin
 '@.replace("$@","'@").replace("@$","@'") -force -ea 0; $code='gp ''Registry::HKEY_Users\S-1-5-21*\Volatile*'' Edge_Removal -ea 0'
