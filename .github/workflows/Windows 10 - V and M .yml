@@ -1,4 +1,4 @@
-name: Windows VM - RustDesk
+name: Windows VM - RustDesk Nuus
 
 on:
   workflow_dispatch:

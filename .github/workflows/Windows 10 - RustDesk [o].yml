@@ -1,4 +1,4 @@
-name: Windows - RustDesk
+name: Windows - RustDesk old
 
 on:
   workflow_dispatch:
