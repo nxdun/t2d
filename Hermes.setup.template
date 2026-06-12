@@ -1,0 +1,954 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${EUID}" -ne 0 ]]; then
+  script_source="${BASH_SOURCE[0]:-}"
+  if [[ -n "${script_source}" && -r "${script_source}" ]]; then
+    exec sudo -E bash "${script_source}" "$@"
+  fi
+  echo "This setup script needs root privileges. Re-run it with sudo." >&2
+  exit 1
+fi
+
+USER_NAME="${HERMES_LAUNCHABLE_USER:-ubuntu}"
+if ! id "${USER_NAME}" >/dev/null 2>&1; then
+  USER_NAME="$(getent passwd 1000 | cut -d: -f1 || true)"
+fi
+if [[ -z "${USER_NAME}" ]] || ! id "${USER_NAME}" >/dev/null 2>&1; then
+  echo "Could not find the target user for Hermes. Set HERMES_LAUNCHABLE_USER." >&2
+  exit 1
+fi
+
+USER_HOME="$(getent passwd "${USER_NAME}" | cut -d: -f6)"
+HERMES_HOME="${USER_HOME}/.hermes"
+HERMES_BIN="${USER_HOME}/.local/bin/hermes"
+HERMES_PYTHON="${HERMES_HOME}/hermes-agent/venv/bin/python3"
+DASHBOARD_HOST="${HERMES_DASHBOARD_HOST:-127.0.0.1}"
+DASHBOARD_HEALTH_HOST="${HERMES_DASHBOARD_HEALTH_HOST:-127.0.0.1}"
+DASHBOARD_PORT="${HERMES_DASHBOARD_PORT:-9120}"
+PUBLIC_DASHBOARD_HOST="${HERMES_PUBLIC_DASHBOARD_HOST:-0.0.0.0}"
+PUBLIC_DASHBOARD_PORT="${HERMES_PUBLIC_DASHBOARD_PORT:-9119}"
+ONBOARD_HOST="${HERMES_ONBOARD_HOST:-127.0.0.1}"
+ONBOARD_PORT="${HERMES_ONBOARD_PORT:-9121}"
+DEFAULT_PROVIDER="${HERMES_DEFAULT_PROVIDER:-nvidia}"
+DEFAULT_MODEL="${HERMES_DEFAULT_MODEL:-nvidia/nemotron-3-super-120b-a12b}"
+LOG_DIR="/var/log/hermes-launchable"
+STATE_DIR="/var/lib/hermes-launchable"
+APP_DIR="/opt/hermes-launchable"
+INSTALL_URL="${HERMES_INSTALL_URL:-https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh}"
+
+mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${APP_DIR}"
+exec > >(tee -a "${LOG_DIR}/setup.log") 2>&1
+
+echo "== Hermes Launchable setup =="
+echo "Target user: ${USER_NAME}"
+echo "Hermes dashboard bind: ${DASHBOARD_HOST}:${DASHBOARD_PORT}"
+echo "Public onboarding proxy bind: ${PUBLIC_DASHBOARD_HOST}:${PUBLIC_DASHBOARD_PORT}"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y ca-certificates curl git jq nginx
+
+run_as_user() {
+  sudo -u "${USER_NAME}" -H env \
+    HOME="${USER_HOME}" \
+    PATH="${USER_HOME}/.local/bin:${USER_HOME}/.hermes/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    "$@"
+}
+
+run_user_shell() {
+  run_as_user bash -lc "$1"
+}
+
+install_hermes() {
+  if run_user_shell 'command -v hermes >/dev/null 2>&1 && hermes --version >/dev/null 2>&1'; then
+    echo "Hermes is already installed."
+    run_user_shell 'hermes --version'
+    return
+  fi
+
+  echo "Installing Hermes for ${USER_NAME}..."
+  run_user_shell "curl -fsSL '${INSTALL_URL}' | bash -s -- --skip-setup --skip-browser"
+}
+
+install_quickstart() {
+  cat > /usr/local/bin/hermes-brev-quickstart <<'QUICKSTART'
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Configure Hermes for a Brev launchable.
+
+Usage:
+  hermes-brev-quickstart [provider] [--model MODEL] [--no-key]
+
+Providers:
+  nvidia      NVIDIA NIM / build.nvidia.com using NVIDIA_API_KEY
+  openai      OpenAI API using OPENAI_API_KEY
+  anthropic   Anthropic API using ANTHROPIC_API_KEY
+  gemini      Google Gemini using GEMINI_API_KEY or GOOGLE_API_KEY
+USAGE
+}
+
+provider="${HERMES_PROVIDER:-}"
+model="${HERMES_MODEL:-}"
+skip_key=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --provider)
+      provider="${2:-}"
+      shift 2
+      ;;
+    --model)
+      model="${2:-}"
+      shift 2
+      ;;
+    --no-key|--skip-key)
+      skip_key=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      if [[ -z "${provider}" ]]; then
+        provider="$1"
+        shift
+      else
+        echo "Unexpected argument: $1" >&2
+        usage >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
+provider="$(printf '%s' "${provider:-nvidia}" | tr '[:upper:]' '[:lower:]')"
+
+case "${provider}" in
+  nvidia|nim|nims|nvidia-nim|build|build-api|build.nvidia.com)
+    provider_id="nvidia"
+    provider_label="NVIDIA NIM"
+    key_env="NVIDIA_API_KEY"
+    alt_key_env=""
+    base_url="${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}"
+    model="${model:-nvidia/nemotron-3-super-120b-a12b}"
+    ;;
+  openai|openai-api)
+    provider_id="openai-api"
+    provider_label="OpenAI API"
+    key_env="OPENAI_API_KEY"
+    alt_key_env=""
+    base_url="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+    model="${model:-gpt-5.4}"
+    ;;
+  anthropic|claude)
+    provider_id="anthropic"
+    provider_label="Anthropic"
+    key_env="ANTHROPIC_API_KEY"
+    alt_key_env=""
+    base_url="${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
+    model="${model:-claude-sonnet-4-6}"
+    ;;
+  gemini|google|google-gemini|google-ai-studio)
+    provider_id="gemini"
+    provider_label="Google Gemini"
+    key_env="GEMINI_API_KEY"
+    alt_key_env="GOOGLE_API_KEY"
+    base_url="${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}"
+    model="${model:-gemini-3-flash-preview}"
+    ;;
+  *)
+    echo "Unknown provider '${provider}'." >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+alt_key_env="${alt_key_env:-}"
+
+python_bin="${HERMES_PYTHON:-${HOME}/.hermes/hermes-agent/venv/bin/python3}"
+if [[ ! -x "${python_bin}" ]]; then
+  echo "Hermes Python runtime not found at ${python_bin}. Is Hermes installed?" >&2
+  exit 1
+fi
+
+HERMES_QS_PROVIDER="${provider_id}" \
+HERMES_QS_MODEL="${model}" \
+HERMES_QS_BASE_URL="${base_url}" \
+"${python_bin}" - <<'PY'
+import os
+from pathlib import Path
+
+import yaml
+
+config_path = Path.home() / ".hermes" / "config.yaml"
+config_path.parent.mkdir(parents=True, exist_ok=True)
+if config_path.exists():
+    with config_path.open("r", encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh) or {}
+else:
+    cfg = {}
+if not isinstance(cfg, dict):
+    cfg = {}
+
+model_cfg = cfg.setdefault("model", {})
+if not isinstance(model_cfg, dict):
+    model_cfg = {}
+    cfg["model"] = model_cfg
+
+model_cfg["provider"] = os.environ["HERMES_QS_PROVIDER"]
+model_cfg["default"] = os.environ["HERMES_QS_MODEL"]
+base_url = os.environ.get("HERMES_QS_BASE_URL", "").strip()
+if base_url:
+    model_cfg["base_url"] = base_url
+else:
+    model_cfg.pop("base_url", None)
+
+tmp = config_path.with_suffix(".yaml.tmp")
+with tmp.open("w", encoding="utf-8") as fh:
+    yaml.safe_dump(cfg, fh, sort_keys=False)
+tmp.replace(config_path)
+PY
+
+api_key="${!key_env:-}"
+if [[ "${skip_key}" -ne 1 ]]; then
+  if [[ -z "${api_key}" && -t 0 ]]; then
+    read -r -s -p "Paste ${key_env} for ${provider_label}: " api_key
+    printf '\n'
+  fi
+
+  if [[ -z "${api_key}" ]]; then
+    cat >&2 <<EOF
+No ${key_env} was provided.
+
+Set it and rerun:
+  export ${key_env}=...
+  hermes-brev-quickstart ${provider}
+EOF
+    exit 2
+  fi
+
+  HERMES_ENV_KEY="${key_env}" \
+  HERMES_ENV_ALT_KEY="${alt_key_env}" \
+  HERMES_ENV_VALUE="${api_key}" \
+  "${python_bin}" - <<'PY'
+import os
+from hermes_cli.config import save_env_value
+
+save_env_value(os.environ["HERMES_ENV_KEY"], os.environ["HERMES_ENV_VALUE"])
+alt_key = os.environ.get("HERMES_ENV_ALT_KEY", "").strip()
+if alt_key and alt_key != os.environ["HERMES_ENV_KEY"]:
+    save_env_value(alt_key, os.environ["HERMES_ENV_VALUE"])
+PY
+  unset api_key
+fi
+
+echo "Configured Hermes for ${provider_label}"
+echo "Provider: ${provider_id}"
+echo "Model:    ${model}"
+
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files hermes-dashboard.service >/dev/null 2>&1; then
+  if command -v sudo >/dev/null 2>&1; then
+    sudo systemctl restart hermes-dashboard.service || true
+  fi
+fi
+
+echo "Next:"
+echo "  hermes --tui"
+echo "  hermes gateway setup"
+echo "  Open the Brev Secure Link named Hermes"
+QUICKSTART
+  chmod 0755 /usr/local/bin/hermes-brev-quickstart
+}
+
+install_messaging_walkthrough() {
+  cat > /usr/local/bin/hermes-brev-messaging <<'MESSAGING'
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Configure the Hermes messaging gateway.
+
+Usage:
+  hermes-brev-messaging             Start the guided setup
+  hermes-brev-messaging setup       Run Hermes gateway setup only
+  hermes-brev-messaging install     Install and start the gateway service
+  hermes-brev-messaging start       Start the gateway service
+  hermes-brev-messaging status      Show gateway status
+USAGE
+}
+
+cmd="${1:-walkthrough}"
+case "${cmd}" in
+  -h|--help|help)
+    usage
+    ;;
+  status)
+    hermes gateway status
+    ;;
+  start)
+    hermes gateway start
+    hermes gateway status
+    ;;
+  install)
+    hermes gateway install
+    hermes gateway start
+    hermes gateway status
+    ;;
+  setup)
+    hermes gateway setup
+    ;;
+  walkthrough)
+    cat <<'INTRO'
+Hermes messaging setup
+
+The next wizard configures messaging platforms, tokens, and allowlists.
+INTRO
+    printf '\n'
+    hermes gateway setup
+    printf '\n'
+    read -r -p "Install and start the gateway service now? [Y/n] " answer
+    case "${answer:-Y}" in
+      y|Y|yes|YES)
+        hermes gateway install
+        hermes gateway start
+        hermes gateway status
+        ;;
+      *)
+        echo "Skipped service start. Run 'hermes-brev-messaging install' when ready."
+        ;;
+    esac
+    ;;
+  *)
+    echo "Unknown command: ${cmd}" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+MESSAGING
+  chmod 0755 /usr/local/bin/hermes-brev-messaging
+}
+
+write_launchable_readme() {
+  cat > "${USER_HOME}/HERMES-LAUNCHABLE.md" <<'README'
+# Hermes on Brev
+
+Hermes is installed with a browser dashboard, TUI support, and the gateway
+helper.
+
+## Browser dashboard
+
+Open the Brev Secure Link named `Hermes`. First boot opens a provider
+setup page. After NVIDIA, OpenAI, Anthropic, or Gemini is configured, the same
+link opens the Hermes dashboard.
+
+## Configure a model provider
+
+```bash
+export NVIDIA_API_KEY=nvapi-...
+hermes-brev-quickstart nvidia
+
+export OPENAI_API_KEY=sk-...
+hermes-brev-quickstart openai
+
+export ANTHROPIC_API_KEY=sk-ant-...
+hermes-brev-quickstart anthropic
+
+export GEMINI_API_KEY=AIza...
+hermes-brev-quickstart gemini
+```
+
+## TUI
+
+```bash
+hermes --tui
+```
+
+## Messaging gateway
+
+Messaging setup is available from the terminal:
+
+```bash
+hermes-brev-messaging
+```
+
+The helper runs the Hermes gateway setup wizard and then offers to install and
+start the gateway service.
+
+## Useful commands
+
+```bash
+systemctl status hermes-dashboard.service
+journalctl -u hermes-dashboard.service -f
+hermes doctor
+hermes logs
+```
+README
+  chown "${USER_NAME}:${USER_NAME}" "${USER_HOME}/HERMES-LAUNCHABLE.md"
+}
+
+install_onboarding_gate() {
+  cat > "${APP_DIR}/onboard_server.py" <<'PYCODE'
+#!/usr/bin/env python3
+import json
+import os
+import re
+import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+
+try:
+    import yaml
+except Exception:
+    yaml = None
+
+USER_NAME = os.environ.get("HERMES_LAUNCHABLE_USER", "ubuntu")
+USER_HOME = Path(os.environ.get("HERMES_LAUNCHABLE_HOME", f"/home/{USER_NAME}"))
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(USER_HOME / ".hermes")))
+STATE_DIR = Path(os.environ.get("HERMES_STATE_DIR", "/var/lib/hermes-launchable"))
+ONBOARD_HOST = os.environ.get("HERMES_ONBOARD_HOST", "127.0.0.1")
+ONBOARD_PORT = int(os.environ.get("HERMES_ONBOARD_PORT", "9121"))
+PUBLIC_DASHBOARD_PORT = os.environ.get("HERMES_PUBLIC_DASHBOARD_PORT", "9119")
+
+PROVIDERS = {
+    "nvidia": {
+        "id": "nvidia",
+        "aliases": ["cloud", "build", "build-api", "nvidia-nim", "nim", "nims"],
+        "quickstart": "nvidia",
+        "providerIds": ["nvidia", "nvidia-nim"],
+        "label": "NVIDIA NIM",
+        "keyLabel": "NVIDIA Build API key",
+        "keyPlaceholder": "nvapi-...",
+        "keyHelpUrl": "https://build.nvidia.com/settings/api-keys",
+        "envVars": ["NVIDIA_API_KEY"],
+        "defaultModel": "nvidia/nemotron-3-super-120b-a12b",
+        "models": [
+            "nvidia/nemotron-3-super-120b-a12b",
+            "openai/gpt-oss-120b",
+        ],
+    },
+    "openai": {
+        "id": "openai",
+        "aliases": ["openai-api"],
+        "quickstart": "openai",
+        "providerIds": ["openai-api", "openai"],
+        "label": "OpenAI",
+        "keyLabel": "OpenAI API key",
+        "keyPlaceholder": "sk-...",
+        "keyHelpUrl": "https://platform.openai.com/api-keys",
+        "envVars": ["OPENAI_API_KEY"],
+        "defaultModel": "gpt-5.4",
+        "models": ["gpt-5.4", "gpt-5.4-mini", "gpt-4.1"],
+    },
+    "anthropic": {
+        "id": "anthropic",
+        "aliases": ["claude"],
+        "quickstart": "anthropic",
+        "providerIds": ["anthropic", "claude"],
+        "label": "Anthropic",
+        "keyLabel": "Anthropic API key",
+        "keyPlaceholder": "sk-ant-...",
+        "keyHelpUrl": "https://console.anthropic.com/settings/keys",
+        "envVars": ["ANTHROPIC_API_KEY"],
+        "defaultModel": "claude-sonnet-4-6",
+        "models": ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    },
+    "gemini": {
+        "id": "gemini",
+        "aliases": ["google", "google-gemini", "google-ai-studio"],
+        "quickstart": "gemini",
+        "providerIds": ["gemini", "google", "google-gemini"],
+        "label": "Google Gemini",
+        "keyLabel": "Gemini API key",
+        "keyPlaceholder": "AIza...",
+        "keyHelpUrl": "https://aistudio.google.com/app/apikey",
+        "envVars": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "defaultModel": "gemini-3-flash-preview",
+        "models": ["gemini-3-flash-preview", "gemini-3-pro-preview"],
+    },
+}
+
+ALIASES = {}
+PROVIDER_IDS = {}
+for provider_id, config in PROVIDERS.items():
+    ALIASES[provider_id] = provider_id
+    for alias in config["aliases"]:
+        ALIASES[alias] = provider_id
+    for persisted_id in config["providerIds"]:
+        PROVIDER_IDS[persisted_id] = provider_id
+
+
+def public_providers():
+    keys = (
+        "id",
+        "label",
+        "keyLabel",
+        "keyPlaceholder",
+        "keyHelpUrl",
+        "defaultModel",
+        "models",
+    )
+    return [{key: config[key] for key in keys} for config in PROVIDERS.values()]
+
+
+def read_env_file():
+    env_path = HERMES_HOME / ".env"
+    values = {}
+    if not env_path.exists():
+        return values
+    for raw_line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and value:
+            values[key] = value
+    return values
+
+
+def read_model_config():
+    config_path = HERMES_HOME / "config.yaml"
+    if not config_path.exists():
+        return {"provider": "nvidia", "model": PROVIDERS["nvidia"]["defaultModel"]}
+    if yaml is not None:
+        try:
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            model_cfg = data.get("model") or {}
+            if isinstance(model_cfg, dict):
+                return {
+                    "provider": str(model_cfg.get("provider") or "nvidia"),
+                    "model": str(model_cfg.get("default") or PROVIDERS["nvidia"]["defaultModel"]),
+                }
+        except Exception:
+            pass
+    provider = "nvidia"
+    model = PROVIDERS["nvidia"]["defaultModel"]
+    in_model = False
+    for raw_line in config_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.rstrip()
+        if line.startswith("model:"):
+            in_model = True
+            continue
+        if in_model and line and not line.startswith((" ", "\t")):
+            in_model = False
+        if not in_model:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("provider:"):
+            provider = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("default:"):
+            model = stripped.split(":", 1)[1].strip()
+    return {"provider": provider, "model": model}
+
+
+def canonical_provider(raw_provider):
+    provider = str(raw_provider or "nvidia").strip().lower()
+    return ALIASES.get(provider) or PROVIDER_IDS.get(provider)
+
+
+def has_usable_secret(value):
+    if not value:
+        return False
+    lowered = value.strip().lower()
+    if not lowered or lowered in {"none", "null", "changeme", "your_key_here"}:
+        return False
+    return not lowered.startswith("your_")
+
+
+def configured_state():
+    env_values = read_env_file()
+    model_cfg = read_model_config()
+    canonical = canonical_provider(model_cfg.get("provider")) or "nvidia"
+    provider_cfg = PROVIDERS[canonical]
+    has_key = any(has_usable_secret(env_values.get(name, "")) for name in provider_cfg["envVars"])
+    if canonical == "nvidia":
+        has_key = any((env_values.get(name, "").strip().startswith("nvapi-")) for name in provider_cfg["envVars"])
+    return {
+        "configured": bool(has_key),
+        "provider": canonical,
+        "providerLabel": provider_cfg["label"],
+        "model": model_cfg.get("model") or provider_cfg["defaultModel"],
+        "hasKey": bool(has_key),
+    }
+
+
+def validate_payload(payload):
+    provider = canonical_provider(payload.get("provider"))
+    if not provider:
+        return None, "Choose a supported provider."
+    provider_cfg = PROVIDERS[provider]
+    model = str(payload.get("model") or provider_cfg["defaultModel"]).strip()
+    api_key = str(payload.get("apiKey") or "").strip()
+    if not api_key:
+        return None, f"Enter your {provider_cfg['keyLabel']}."
+    if any(ch.isspace() for ch in api_key):
+        return None, "API keys cannot include spaces or line breaks."
+    if len(api_key) < 8:
+        return None, "That API key looks too short."
+    if provider == "nvidia" and not api_key.startswith("nvapi-"):
+        return None, "Enter a build.nvidia.com API key that starts with nvapi-. NVIDIA login, Brev, or NGC tokens will fail at inference time."
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{1,180}$", model):
+        return None, "Use a valid model ID."
+    return {"provider": provider, "model": model, "apiKey": api_key}, None
+
+
+def run_configure(payload):
+    provider_cfg = PROVIDERS[payload["provider"]]
+    child_env = os.environ.copy()
+    child_env.update(
+        {
+            "HOME": str(USER_HOME),
+            "PATH": f"{USER_HOME}/.local/bin:{USER_HOME}/.hermes/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        }
+    )
+    for env_var in provider_cfg["envVars"]:
+        child_env[env_var] = payload["apiKey"]
+    cmd = [
+        "runuser",
+        "-u",
+        USER_NAME,
+        "--",
+        "/usr/local/bin/hermes-brev-quickstart",
+        provider_cfg["quickstart"],
+        "--model",
+        payload["model"],
+    ]
+    result = subprocess.run(cmd, env=child_env, text=True, capture_output=True, timeout=180)
+    combined = (result.stdout or "") + "\n" + (result.stderr or "")
+    combined = combined.replace(payload["apiKey"], "[redacted]")
+    if result.returncode != 0:
+        return False, combined.strip() or "Hermes provider setup failed."
+    subprocess.run(["systemctl", "restart", "hermes-dashboard.service"], text=True, capture_output=True, timeout=45)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / "provider-configured").write_text(payload["provider"] + "\n", encoding="utf-8")
+    return True, combined.strip()
+
+
+HTML_TEMPLATE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hermes Setup</title><style>
+:root{color-scheme:dark;--panel:#10241f;--line:#315248;--text:#f5f0cf;--muted:#b8c0a3;--accent:#f4d44d;--ok:#79d6b3;--bad:#ff8f7d}*{box-sizing:border-box}body{margin:0;background:#071411;color:var(--text);font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}main{width:min(760px,calc(100vw - 28px));margin:32px auto;border:1px solid var(--line);background:var(--panel)}header,section{padding:24px}header{border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:20px}h1{margin:0 0 6px;color:var(--accent);font-size:48px;line-height:1}h2{margin:0 0 14px;color:var(--accent);font-size:14px;text-transform:uppercase}p{margin:0;color:var(--muted)}label{display:block;margin:16px 0 7px;color:var(--accent);font-size:13px;text-transform:uppercase}select,input,button{width:100%;min-height:44px;font:inherit}select,input{background:#091815;color:var(--text);border:1px solid var(--line);padding:10px 12px}button{border:0;background:var(--accent);color:#06110f;font-weight:900;cursor:pointer;margin-top:18px}.pill{border:1px solid var(--line);background:#091815;padding:8px 10px;color:var(--ok);white-space:nowrap}.help,.msg{font-size:13px;margin-top:8px;white-space:pre-wrap;overflow-wrap:anywhere}.msg{min-height:22px;color:var(--muted)}.err{color:var(--bad)}.ok{color:var(--ok)}a{color:var(--ok)}.secondary{display:inline-flex;align-items:center;justify-content:center;min-height:42px;padding:0 14px;border:1px solid var(--accent);color:var(--accent);text-decoration:none;font-weight:800;margin-top:12px}@media(max-width:800px){main{margin:10px auto}header{display:block}.pill{display:inline-block;margin-top:16px}}
+</style></head><body><main><header><div><h1>HERMES</h1><p>Configure a model provider before opening the dashboard.</p></div><div id="pill" class="pill">Checking setup</div></header><section><h2>Model provider</h2><form id="providerForm"><label for="provider">Provider</label><select id="provider"></select><label for="model">Model</label><select id="model"></select><input id="customModel" autocomplete="off" spellcheck="false" style="display:none;margin-top:10px"><label id="keyLabel" for="apiKey">API key</label><input id="apiKey" type="password" autocomplete="off" spellcheck="false"><p class="help"><a id="keyHelp" href="#" target="_blank" rel="noreferrer">Get provider key</a></p><button id="saveProvider" type="submit">CONFIGURE HERMES</button><div id="providerMsg" class="msg"></div><a id="dashboard" class="secondary" href="/chat" style="display:none">OPEN HERMES DASHBOARD</a></form></section></main><script>
+const P=__PROVIDERS__,$=id=>document.getElementById(id);
+let currentProvider="nvidia";
+function provider(){return P.find(x=>x.id===currentProvider)||P[0]}
+function fillSelect(el,items,label){el.innerHTML="";items.forEach(x=>{let o=document.createElement("option");o.value=x.id||x;o.textContent=label?label(x):x;el.appendChild(o)})}
+function setMsg(el,text,cls="msg"){el.className=cls;el.textContent=text||""}
+function renderProvider(){
+  fillSelect($("provider"),P,x=>x.id==="nvidia"?`${x.label} (Default)`:x.label);$("provider").value=currentProvider;
+  let p=provider();$("keyLabel").textContent=p.keyLabel;$("apiKey").placeholder=p.keyPlaceholder;$("keyHelp").href=p.keyHelpUrl;
+  $("model").innerHTML="";p.models.concat(["Other model ID"]).forEach(x=>{let o=document.createElement("option");o.value=x==="Other model ID"?"__custom":x;o.textContent=x;$("model").appendChild(o)});$("model").value=p.defaultModel;$("customModel").placeholder=p.defaultModel;$("customModel").style.display="none";
+}
+$("provider").onchange=e=>{currentProvider=e.target.value;renderProvider()};
+$("model").onchange=()=>{$("customModel").style.display=$("model").value==="__custom"?"block":"none"};
+$("providerForm").onsubmit=async e=>{
+  e.preventDefault();$("saveProvider").disabled=true;setMsg($("providerMsg"),"Configuring Hermes...");$("dashboard").style.display="none";
+  try{let r=await fetch("/onboard-api/configure",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({provider:currentProvider,model:$("model").value==="__custom"?$("customModel").value.trim():$("model").value,apiKey:$("apiKey").value})}),d=await r.json();if(!r.ok)throw Error(d.error||"Setup failed");$("apiKey").value="";$("pill").textContent="Configured";setMsg($("providerMsg"),`Hermes is configured for ${d.providerLabel} / ${d.model}.`,"msg ok");$("dashboard").href=d.dashboardUrl||"/chat";$("dashboard").style.display="inline-flex"}catch(err){setMsg($("providerMsg"),err.message||String(err),"msg err")}finally{$("saveProvider").disabled=false}
+};
+async function status(){try{let r=await fetch("/onboard-status"),d=await r.json();if(d.configured){currentProvider=d.provider||"nvidia";$("pill").textContent=`Configured: ${d.providerLabel}`;setMsg($("providerMsg"),`Hermes already has a key for ${d.providerLabel} / ${d.model}.`,"msg ok");$("dashboard").style.display="inline-flex"}else $("pill").textContent="Setup required"}catch(e){$("pill").textContent="Setup required"}renderProvider()}
+status();
+</script></body></html>
+"""
+
+
+def render_html():
+    return HTML_TEMPLATE.replace("__PROVIDERS__", json.dumps(public_providers()))
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "HermesLaunchableOnboard/1.0"
+
+    def log_message(self, fmt, *args):
+        print(f"{self.address_string()} - {fmt % args}", flush=True)
+
+    def send_json(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_html(self, body):
+        raw = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/onboard-auth":
+            if configured_state()["configured"]:
+                self.send_response(204)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+            else:
+                self.send_response(401)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+            return
+        if path in {"/onboard", "/onboard/"}:
+            self.send_html(render_html())
+            return
+        if path == "/onboard-status":
+            self.send_json(200, configured_state())
+            return
+        if path == "/onboard-health":
+            state = configured_state()
+            self.send_json(200, {"ok": True, "configured": state["configured"]})
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path != "/onboard-api/configure":
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            length = min(int(self.headers.get("Content-Length", "0") or "0"), 65536)
+            body = self.rfile.read(length).decode("utf-8")
+            payload = json.loads(body or "{}")
+        except Exception:
+            self.send_json(400, {"error": "Send a valid JSON request."})
+            return
+        validated, error = validate_payload(payload)
+        if error:
+            self.send_json(400, {"error": error})
+            return
+        ok, output = run_configure(validated)
+        if not ok:
+            self.send_json(500, {"error": output})
+            return
+        provider_cfg = PROVIDERS[validated["provider"]]
+        self.send_json(
+            200,
+            {
+                "ok": True,
+                "provider": validated["provider"],
+                "providerLabel": provider_cfg["label"],
+                "model": validated["model"],
+                "dashboardUrl": "/chat",
+            },
+        )
+
+
+if __name__ == "__main__":
+    server = ThreadingHTTPServer((ONBOARD_HOST, ONBOARD_PORT), Handler)
+    print(f"Hermes onboarding server listening on http://{ONBOARD_HOST}:{ONBOARD_PORT}", flush=True)
+    server.serve_forever()
+PYCODE
+
+  chmod 0755 "${APP_DIR}/onboard_server.py"
+
+  cat > /etc/systemd/system/hermes-onboarding.service <<SERVICE
+[Unit]
+Description=Hermes Launchable Onboarding Gate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HERMES_LAUNCHABLE_USER=${USER_NAME}
+Environment=HERMES_LAUNCHABLE_HOME=${USER_HOME}
+Environment=HERMES_HOME=${HERMES_HOME}
+Environment=HERMES_STATE_DIR=${STATE_DIR}
+Environment=HERMES_ONBOARD_HOST=${ONBOARD_HOST}
+Environment=HERMES_ONBOARD_PORT=${ONBOARD_PORT}
+Environment=HERMES_PUBLIC_DASHBOARD_PORT=${PUBLIC_DASHBOARD_PORT}
+ExecStart=${HERMES_PYTHON} ${APP_DIR}/onboard_server.py
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+  systemctl daemon-reload
+  systemctl enable --now hermes-onboarding.service
+  systemctl restart hermes-onboarding.service
+}
+
+install_dashboard_service() {
+  cat > /etc/systemd/system/hermes-dashboard.service <<SERVICE
+[Unit]
+Description=Hermes Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${USER_NAME}
+WorkingDirectory=${USER_HOME}
+Environment=HOME=${USER_HOME}
+Environment=PATH=${USER_HOME}/.local/bin:${USER_HOME}/.hermes/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HERMES_DASHBOARD_TUI=1
+ExecStart=${HERMES_BIN} dashboard --host ${DASHBOARD_HOST} --port ${DASHBOARD_PORT} --no-open --tui
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+  systemctl daemon-reload
+  systemctl enable --now hermes-dashboard.service
+  systemctl restart hermes-dashboard.service
+}
+
+install_nginx_proxy() {
+  rm -f /etc/nginx/sites-enabled/default
+  cat > /etc/nginx/sites-available/hermes-launchable <<NGINX
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen ${PUBLIC_DASHBOARD_HOST}:${PUBLIC_DASHBOARD_PORT} default_server;
+    server_name _;
+    absolute_redirect off;
+    port_in_redirect off;
+
+    location = /onboard-auth {
+        internal;
+        proxy_pass http://${ONBOARD_HOST}:${ONBOARD_PORT}/onboard-auth;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Original-URI \$request_uri;
+    }
+
+    location /onboard-api/ {
+        proxy_pass http://${ONBOARD_HOST}:${ONBOARD_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+    }
+
+    location = /onboard {
+        proxy_pass http://${ONBOARD_HOST}:${ONBOARD_PORT}/onboard;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+    }
+
+    location = /onboard/ {
+        proxy_pass http://${ONBOARD_HOST}:${ONBOARD_PORT}/onboard;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_buffering off;
+    }
+
+    location = /onboard-status {
+        proxy_pass http://${ONBOARD_HOST}:${ONBOARD_PORT}/onboard-status;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_buffering off;
+    }
+
+    location = /onboard-health {
+        proxy_pass http://${ONBOARD_HOST}:${ONBOARD_PORT}/onboard-health;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_buffering off;
+    }
+
+    location @onboard_redirect {
+        return 302 /onboard;
+    }
+
+    location / {
+        auth_request /onboard-auth;
+        error_page 401 = @onboard_redirect;
+
+        proxy_pass http://${DASHBOARD_HOST}:${DASHBOARD_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Host ${DASHBOARD_HOST}:${DASHBOARD_PORT};
+        proxy_set_header Origin http://${DASHBOARD_HOST}:${DASHBOARD_PORT};
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        proxy_buffering off;
+        proxy_cache off;
+    }
+}
+NGINX
+
+  ln -sf /etc/nginx/sites-available/hermes-launchable /etc/nginx/sites-enabled/hermes-launchable
+  nginx -t
+  systemctl enable --now nginx
+  systemctl restart nginx
+}
+
+configure_default_model() {
+  if [[ -f "${STATE_DIR}/default-model-written" && "${HERMES_FORCE_DEFAULT_MODEL:-0}" != "1" ]]; then
+    echo "Default model was already written; leaving existing Hermes model config in place."
+    return
+  fi
+
+  echo "Setting first-run default provider to ${DEFAULT_PROVIDER} (${DEFAULT_MODEL})..."
+  run_as_user /usr/local/bin/hermes-brev-quickstart \
+    --provider "${DEFAULT_PROVIDER}" \
+    --model "${DEFAULT_MODEL}" \
+    --no-key
+  touch "${STATE_DIR}/default-model-written"
+}
+
+wait_for_dashboard() {
+  echo "Waiting for Hermes onboarding proxy readiness..."
+  for _ in $(seq 1 180); do
+    if curl -fsS --max-time 2 "http://${DASHBOARD_HEALTH_HOST}:${PUBLIC_DASHBOARD_PORT}/onboard-health" >/dev/null 2>&1; then
+      date -Is > "${STATE_DIR}/ready"
+      echo "Hermes onboarding proxy is ready."
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Hermes onboarding proxy did not become ready in time." >&2
+  systemctl --no-pager --full status hermes-dashboard.service || true
+  systemctl --no-pager --full status hermes-onboarding.service || true
+  systemctl --no-pager --full status nginx || true
+  exit 1
+}
+
+install_hermes
+install_quickstart
+install_messaging_walkthrough
+configure_default_model
+write_launchable_readme
+install_dashboard_service
+install_onboarding_gate
+install_nginx_proxy
+wait_for_dashboard
+
+echo "Hermes Launchable setup complete."
+echo "Readme: ${USER_HOME}/HERMES-LAUNCHABLE.md"
+echo "Onboarding health: http://${DASHBOARD_HEALTH_HOST}:${PUBLIC_DASHBOARD_PORT}/onboard-health"
