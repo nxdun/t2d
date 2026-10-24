@@ -41,8 +41,8 @@ services:
     container_name: caddy-fileserver
     restart: unless-stopped
     network_mode: bridge
-    command: caddy file-server --browse --listen :8082 --root /downloads
+    command: caddy file-server --browse --listen :8000 --root /downloads
     ports:
-      - "8082:8082"
+      - "8000:8000"
     volumes:
       - ./downloads:/downloads
