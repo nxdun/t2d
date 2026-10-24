@@ -35,3 +35,14 @@ services:
       - ./downloads:/ftp/${FTP_USER:-admin}
     depends_on:
       - qbittorrent
+
+  caddy:
+    image: caddy:alpine
+    container_name: caddy-fileserver
+    restart: unless-stopped
+    network_mode: bridge
+    command: caddy file-server --browse --listen :8082 --root /downloads
+    ports:
+      - "8082:8082"
+    volumes:
+      - ./downloads:/downloads
