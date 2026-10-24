@@ -22,7 +22,7 @@ services:
     container_name: ftp-server
     restart: unless-stopped
     environment:
-      - USERS=${FTP_USER:-admin}|${FTP_PASS:-admin123}|/downloads|${PUID:-1000}|${PGID:-1000}
+      - USERS=${FTP_USER:-admin}|${FTP_PASS:-admin123}|/ftp/${FTP_USER:-admin}|${PUID:-1000}|${PGID:-1000}
       - ADDRESS=${FTP_PASV_ADDRESS:-127.0.0.1}
       - MIN_PORT=${FTP_PASV_MIN_PORT:-21000}
       - MAX_PORT=${FTP_PASV_MAX_PORT:-21005}
@@ -30,6 +30,6 @@ services:
       - "${FTP_PORT:-21}:21"
       - "${FTP_PASV_MIN_PORT:-21000}-${FTP_PASV_MAX_PORT:-21005}:${FTP_PASV_MIN_PORT:-21000}-${FTP_PASV_MAX_PORT:-21005}"
     volumes:
-      - ./downloads:/downloads
+      - ./downloads:/ftp/${FTP_USER:-admin}
     depends_on:
       - qbittorrent
