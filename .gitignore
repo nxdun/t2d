@@ -1,0 +1,14 @@
+# Torrent downloads
+downloads/*
+!downloads/.gitkeep
+
+# qBittorrent runtime data
+config/qbittorrent/.cache/
+config/qbittorrent/qBittorrent/logs/
+config/qbittorrent/qBittorrent/ipc-socket
+config/qbittorrent/qBittorrent/lockfile
+config/qbittorrent/qBittorrent/BT_backup/
+config/qbittorrent/qBittorrent/GeoDB/
+config/qbittorrent/qBittorrent/rss/
+config/qbittorrent/qBittorrent/watched_folders.json
+config/qbittorrent/qBittorrent/categories.json
